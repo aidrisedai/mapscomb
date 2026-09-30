@@ -1,0 +1,114 @@
+rules_version = '2';
+
+// MAPS Combinator Founder Workspace
+//
+// admins/{email}   instructors. Created by hand in the Firebase console; never writable from the app.
+// members/{email}  founders allowed in, and which startup they belong to. Managed by instructors in the app.
+// Document IDs are lowercase email addresses.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+    function email() { return request.auth.token.email.lower(); }
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(email()));
+    }
+    function isMember() {
+      return signedIn() && exists(/databases/$(database)/documents/members/$(email()));
+    }
+    function inCohort() { return isAdmin() || isMember(); }
+    function onStartup(startupId) {
+      return isMember()
+        && get(/databases/$(database)/documents/members/$(email())).data.startupId == startupId;
+    }
+    function validWeek(week) { return week.matches('^([1-9]|1[0-2])$'); }
+    function shortText(v, max) { return v is string && v.size() <= max; }
+    function count(v) { return v is number && v >= 0 && v <= 100000000; }
+
+    match /admins/{adminEmail} {
+      // Lets the app (and api/digest.js) ask "am I an instructor?" and nothing more.
+      allow get: if signedIn() && adminEmail == email();
+      allow list, write: if false;
+    }
+
+    match /members/{memberEmail} {
+      allow get: if signedIn() && (memberEmail == email() || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isAdmin()
+        && memberEmail == memberEmail.lower()
+        && request.resource.data.email == memberEmail
+        && shortText(request.resource.data.name, 100)
+        && request.resource.data.startupId is string;
+      allow delete: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      allow read: if inCohort();
+      allow write: if isAdmin();
+    }
+
+    match /digests/{week} {
+      allow read, write: if isAdmin();
+    }
+
+    match /startups/{startupId} {
+      allow read: if inCohort();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (onStartup(startupId)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['oneLiner'])
+            && shortText(request.resource.data.oneLiner, 280));
+
+      match /milestones/{week} {
+        allow read: if inCohort();
+        allow write: if isAdmin();
+        // Founders submit evidence. Only an instructor can verify, and founders
+        // cannot overwrite a milestone once it has been verified.
+        allow create: if onStartup(startupId) && validWeek(week) && validSubmission();
+        allow update: if onStartup(startupId) && validWeek(week)
+          && resource.data.status != 'verified'
+          && validSubmission();
+      }
+
+      match /standups/{week} {
+        allow read: if inCohort();
+        allow write: if isAdmin();
+        allow create, update: if onStartup(startupId) && validWeek(week) && validStandup(week);
+      }
+    }
+
+    function validSubmission() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['status', 'evidence', 'link', 'submittedBy', 'submittedAt'])
+        && d.keys().hasAll(['status', 'evidence', 'submittedBy', 'submittedAt'])
+        && d.status == 'submitted'
+        && shortText(d.evidence, 4000) && d.evidence.size() > 0
+        && (!('link' in d) || (shortText(d.link, 500) && d.link.matches('https?://.+')))
+        && d.submittedBy == email()
+        && d.submittedAt == request.time;
+    }
+
+    function validStandup(week) {
+      let d = request.resource.data;
+      let n = d.numbers;
+      return d.keys().hasOnly(['week', 'shipped', 'numbers', 'blockers', 'nextWeek', 'confidence', 'postedBy', 'postedAt'])
+        && d.keys().hasAll(['week', 'shipped', 'numbers', 'blockers', 'nextWeek', 'confidence', 'postedBy', 'postedAt'])
+        && d.week == int(week)
+        && shortText(d.shipped, 4000)
+        && shortText(d.blockers, 4000)
+        && shortText(d.nextWeek, 4000)
+        && d.confidence is int && d.confidence >= 1 && d.confidence <= 5
+        && n is map
+        && n.keys().hasOnly(['interviews', 'users', 'wau', 'paying', 'revenue'])
+        && n.keys().hasAll(['interviews', 'users', 'wau', 'paying', 'revenue'])
+        && count(n.interviews) && count(n.users) && count(n.wau) && count(n.paying) && count(n.revenue)
+        && d.postedBy == email()
+        && d.postedAt == request.time;
+    }
+  }
+}
